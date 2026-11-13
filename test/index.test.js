@@ -2,6 +2,8 @@
 
 const { test } = require('tape')
 const j = require('..')
+const { buildCyclicGraph, buildCyclicProtoGraph } = require('./fixtures/cyclic')
+const { buildNestedGraph } = require('./fixtures/nested')
 
 test('parse', t => {
   t.test('parses object string', t => {
@@ -644,6 +646,190 @@ test('safe option', t => {
     Error.stackTraceLimit = 42
     t.strictEqual(j.parse(text, { safe: true }), null)
     t.same(Error.stackTraceLimit, 42)
+    t.end()
+  })
+
+  t.end()
+})
+
+test('scan terminates on cyclic and shared object graphs', t => {
+  t.timeoutAfter(2000)
+
+  t.test('visits each object once and returns the same graph', t => {
+    const obj = buildCyclicGraph()
+
+    t.strictEqual(j.scan(obj), obj)
+    t.strictEqual(obj.self, obj)
+    t.strictEqual(obj.a.shared, obj.b.shared)
+    t.strictEqual(obj.a.shared.backRef, obj)
+    t.strictEqual(obj.list[0], obj)
+    t.strictEqual(obj.list[1], obj.a.shared)
+    t.end()
+  })
+
+  t.test('does not duplicate shared sub-objects', t => {
+    const obj = buildCyclicGraph()
+
+    j.scan(obj)
+    t.strictEqual(obj.a.shared, obj.b.shared)
+    t.strictEqual(obj.leaf, undefined)
+    t.end()
+  })
+
+  t.test('does not mutate the prototype of prototype-chained objects', t => {
+    const proto = { inherited: true }
+    const child = Object.create(proto)
+    child.own = 1
+    child.self = child
+
+    t.strictEqual(j.scan(child), child)
+    t.strictEqual(Object.getPrototypeOf(child), proto)
+    t.strictEqual(child.inherited, true)
+    t.strictEqual(Object.prototype.hasOwnProperty.call(child, 'own'), true)
+    t.end()
+  })
+
+  t.test('terminates on deeply nested graphs with back edges', t => {
+    const obj = buildNestedGraph(1000)
+
+    t.strictEqual(j.scan(obj), obj)
+    t.strictEqual(obj.leaf, obj.child.leaf)
+
+    let node = obj
+    let depth = 0
+    while (node.child) {
+      node = node.child
+      depth++
+    }
+    t.strictEqual(depth, 1000)
+    t.strictEqual(node.backRef, obj)
+    t.end()
+  })
+
+  t.test('keeps error semantics for forbidden keys inside cyclic graphs', t => {
+    const obj = buildCyclicProtoGraph()
+
+    t.throws(() => j.scan(obj), SyntaxError)
+    t.strictEqual(obj.self, obj)
+    t.end()
+  })
+
+  t.test('keeps remove semantics inside cyclic graphs', t => {
+    const obj = buildCyclicProtoGraph()
+
+    t.doesNotThrow(() => j.scan(obj, {
+      protoAction: 'remove',
+      constructorAction: 'remove'
+    }))
+    t.strictEqual(
+      Object.prototype.hasOwnProperty.call(obj.nested, '__proto__'),
+      false
+    )
+    t.strictEqual(
+      Object.prototype.hasOwnProperty.call(obj.ctor, 'constructor'),
+      false
+    )
+    t.strictEqual(obj.self, obj)
+    t.strictEqual(obj.nested.owner, obj)
+    t.end()
+  })
+
+  t.test('keeps safe semantics inside cyclic graphs', t => {
+    const obj = buildCyclicProtoGraph()
+
+    t.strictEqual(j.scan(obj, { safe: true }), null)
+    t.strictEqual(obj.self, obj)
+    t.end()
+  })
+
+  t.test('respects ignore actions inside cyclic graphs', t => {
+    const obj = buildCyclicProtoGraph()
+
+    t.strictEqual(
+      j.scan(obj, { protoAction: 'ignore', constructorAction: 'ignore' }),
+      obj
+    )
+    t.strictEqual(
+      Object.prototype.hasOwnProperty.call(obj.nested, '__proto__'),
+      true
+    )
+    t.strictEqual(obj.self, obj)
+    t.end()
+  })
+
+  t.end()
+})
+
+test('parse with reviver handles cyclic and shared graphs', t => {
+  t.timeoutAfter(2000)
+
+  t.test('reviver creating a circular graph does not hang', t => {
+    const text = '{"a": {"x": 1}, "b": {"y": 2}}'
+    const reviver = function (key, value) {
+      if (key === 'b') {
+        value.loop = this.a
+      }
+      if (key === '' && value && typeof value === 'object') {
+        value.rootRef = value
+      }
+      return value
+    }
+
+    const result = j.parse(text, reviver)
+    t.strictEqual(result.rootRef, result)
+    t.strictEqual(result.b.loop, result.a)
+    t.end()
+  })
+
+  t.test('reviver creating shared references keeps remove semantics', t => {
+    const text = '{"a": {"x": 1}, "b": {"__proto__": {"z": 9}}, "c": {"y": 2}}'
+    const reviver = function (key, value) {
+      if (key === 'c') {
+        value.shared = this.a
+      }
+      if (key === '') {
+        value.loop = value
+      }
+      return value
+    }
+
+    const result = j.parse(text, reviver, { protoAction: 'remove' })
+    t.strictEqual(result.loop, result)
+    t.strictEqual(result.c.shared, result.a)
+    t.strictEqual(
+      Object.prototype.hasOwnProperty.call(result.b, '__proto__'),
+      false
+    )
+    t.end()
+  })
+
+  t.test('reviver creating a circular graph keeps safe semantics', t => {
+    const text = '{"a": {"x": 1}, "__proto__": {"z": 9}}'
+    const reviver = function (key, value) {
+      if (key === 'a') {
+        value.loop = this
+      }
+      return value
+    }
+
+    t.strictEqual(j.parse(text, reviver, { safe: true }), null)
+    t.strictEqual(j.safeParse(text, reviver), null)
+    t.end()
+  })
+
+  t.test('reviver creating shared sub-objects does not copy them', t => {
+    const text = '{"a": {"x": 1}, "b": {"y": 2}, "c": {"z": 3}}'
+    const reviver = function (key, value) {
+      if (key === 'b' || key === 'c') {
+        value.ref = this.a
+      }
+      return value
+    }
+
+    const result = j.parse(text, reviver)
+    t.strictEqual(result.b.ref, result.a)
+    t.strictEqual(result.c.ref, result.a)
+    t.strictEqual(result.b.ref, result.c.ref)
     t.end()
   })
 

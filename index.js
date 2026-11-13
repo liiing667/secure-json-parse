@@ -75,6 +75,7 @@ function _parse (text, reviver, options) {
  * `options.constructorAction` is `'error'`.
  */
 function filter (obj, { protoAction = 'error', constructorAction = 'error', safe } = {}) {
+  const visited = new Set()
   let next = [obj]
 
   while (next.length) {
@@ -82,6 +83,11 @@ function filter (obj, { protoAction = 'error', constructorAction = 'error', safe
     next = []
 
     for (const node of nodes) {
+      if (visited.has(node)) {
+        continue
+      }
+      visited.add(node)
+
       if (protoAction !== 'ignore' && Object.prototype.hasOwnProperty.call(node, '__proto__')) { // Avoid calling node.hasOwnProperty directly
         if (safe === true) {
           return null
@@ -106,9 +112,9 @@ function filter (obj, { protoAction = 'error', constructorAction = 'error', safe
         delete node.constructor
       }
 
-      for (const key in node) {
+      for (const key of Object.keys(node)) {
         const value = node[key]
-        if (value && typeof value === 'object') {
+        if (value && typeof value === 'object' && visited.has(value) === false) {
           next.push(value)
         }
       }
